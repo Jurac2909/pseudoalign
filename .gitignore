@@ -1,0 +1,34 @@
+# Compiled binaries
+pseudoalign
+test_pseudoalign
+dbg_kmer
+*.o
+*.out
+build/
+
+# Large reference / read / index / alignment files (not source-controlled)
+*.idx
+*.sam
+*.bam
+*.bin
+*.h5
+*.fai
+*.gtf
+tests/data/ex29*.fastq
+tests/data/hg38*
+tests/data/transcripts.fa
+tests/data/transcripts_5k.fa
+tests/data/tmp.fastq
+
+# Run outputs / logs (regenerable)
+*.log
+results.tsv
+results_*.tsv
+results_full.txt
+comparison_full.tsv
+sam_compare*.txt
+error_report.tsv
+*.bak
+
+# OS cruft
+.DS_Store
