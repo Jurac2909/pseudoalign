@@ -45,13 +45,14 @@ static void cmd_build(int argc, char* argv[])
 static void cmd_align(int argc, char* argv[])
 {
     if (argc < 4) {
-        std::cerr << "Usage: pseudoalign align <index> <reads.fastq> [-l mean_frag] [-s sd_frag] [--pseudobam <out.sam>]\n";
+        std::cerr << "Usage: pseudoalign align <index> <reads.fastq> [-l mean_frag] [-s sd_frag] [--pseudobam <out.sam>] [--min-count <c>]\n";
         std::exit(1);
     }
 
     std::string index_path = argv[2];
     std::string fastq      = argv[3];
     double mean_fl = 200.0, sd_fl = 30.0;
+    double min_count = 0.0;   // post-EM prune threshold (0 = disabled)
     std::string sam_path;
 
     for (int i = 4; i < argc; ++i) {
@@ -61,6 +62,8 @@ static void cmd_align(int argc, char* argv[])
             else              sd_fl   = std::stod(argv[++i]);
         } else if (flag == "--pseudobam" && i + 1 < argc) {
             sam_path = argv[++i];
+        } else if (flag == "--min-count" && i + 1 < argc) {
+            min_count = std::stod(argv[++i]);
         }
     }
 
@@ -139,6 +142,30 @@ static void cmd_align(int argc, char* argv[])
 
     std::cout << "Fragment length  : mean=" << mean_fl << "  sd=" << sd_fl << "\n\n";
     EMResult em = run_em(ec_counts, g, mean_fl, sd_fl);
+
+    // Optional post-EM prune: zero transcripts whose estimated count is below
+    // --min-count and renormalise TPM over the survivors. Off by default
+    // (min_count == 0). NOTE: kallisto itself keeps fractional counts, so this
+    // does NOT make abundances closer to kallisto -- it cuts low-count
+    // over-detections at the cost of some true low-expressers (lower Pearson r).
+    // Provided for downstream analyses that want a cleaner transcript list.
+    if (min_count > 0.0) {
+        uint64_t pruned = 0;
+        double tpm_kept = 0.0;
+        for (size_t t = 0; t < em.counts.size(); ++t) {
+            if (em.counts[t] > 0.0 && em.counts[t] < min_count) {
+                em.counts[t] = 0.0;
+                em.tpm[t]    = 0.0;
+                ++pruned;
+            } else {
+                tpm_kept += em.tpm[t];
+            }
+        }
+        if (tpm_kept > 0.0)
+            for (double& x : em.tpm) x = x / tpm_kept * 1e6;  // renormalise to sum 1e6
+        std::cout << "Post-EM prune    : min-count=" << min_count
+                  << "  -> pruned " << pruned << " transcripts\n\n";
+    }
 
     std::string tsv_path = "results.tsv";
     std::ofstream tsv(tsv_path);
