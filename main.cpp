@@ -5,10 +5,12 @@
 #include "em.hpp"
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 static void cmd_build(int argc, char* argv[])
@@ -42,10 +44,74 @@ static void cmd_build(int argc, char* argv[])
     std::cout << "Done in " << ms << " ms\n";
 }
 
+// Return the idx-th tab-separated field of a SAM record.
+static std::string sam_field(const std::string& s, int idx)
+{
+    int f = 0; size_t start = 0;
+    for (size_t i = 0; i <= s.size(); ++i) {
+        if (i == s.size() || s[i] == '\t') {
+            if (f == idx) return s.substr(start, i - start);
+            ++f; start = i + 1;
+        }
+    }
+    return "";
+}
+
+// EM-aware pseudobam: rewrite the SAM keeping, for each read, only alignments to
+// transcripts that survive the EM ("active"). This mirrors kallisto, whose
+// --pseudobam reports reads only against expressed transcripts rather than the
+// full raw equivalence class. Records arrive grouped by read (written together),
+// so we filter one read's group at a time -- O(1) memory. If every alignment of
+// a read is filtered out, it is re-emitted as unmapped.
+static void filter_sam_emaware(const std::string& path,
+                               const std::unordered_set<std::string>& active)
+{
+    std::ifstream in(path);
+    std::string tmp = path + ".tmp";
+    std::ofstream out(tmp);
+
+    std::string line, cur_q;
+    std::vector<std::string> group;
+
+    auto flush = [&]() {
+        if (group.empty()) return;
+        if (sam_field(group[0], 2) == "*") {   // unmapped read, pass through
+            out << group[0] << "\n";
+            return;
+        }
+        std::vector<const std::string*> keep;
+        for (const auto& rec : group)
+            if (active.count(sam_field(rec, 2))) keep.push_back(&rec);
+        if (keep.empty()) {                     // all assignments filtered -> unmapped
+            out << cur_q << "\t4\t*\t0\t0\t*\t*\t0\t0\t"
+                << sam_field(group[0], 9) << "\t*\n";
+            return;
+        }
+        for (size_t j = 0; j < keep.size(); ++j) {
+            const std::string& r = *keep[j];
+            int flag = (j == 0) ? 0 : 256;      // first survivor primary, rest secondary
+            out << sam_field(r, 0) << "\t" << flag << "\t" << sam_field(r, 2)
+                << "\t" << sam_field(r, 3) << "\t" << sam_field(r, 4) << "\t"
+                << sam_field(r, 5) << "\t*\t0\t0\t" << sam_field(r, 9) << "\t*\n";
+        }
+    };
+
+    while (std::getline(in, line)) {
+        if (!line.empty() && line[0] == '@') { out << line << "\n"; continue; }
+        size_t tab = line.find('\t');
+        std::string q = (tab == std::string::npos) ? line : line.substr(0, tab);
+        if (q != cur_q) { flush(); group.clear(); cur_q = q; }
+        group.push_back(line);
+    }
+    flush();
+    in.close(); out.close();
+    std::rename(tmp.c_str(), path.c_str());
+}
+
 static void cmd_align(int argc, char* argv[])
 {
     if (argc < 4) {
-        std::cerr << "Usage: pseudoalign align <index> <reads.fastq> [-l mean_frag] [-s sd_frag] [--pseudobam <out.sam>] [--min-count <c>]\n";
+        std::cerr << "Usage: pseudoalign align <index> <reads.fastq> [-l mean_frag] [-s sd_frag] [--pseudobam <out.sam>] [--min-count <c>] [--sam-raw]\n";
         std::exit(1);
     }
 
@@ -53,6 +119,7 @@ static void cmd_align(int argc, char* argv[])
     std::string fastq      = argv[3];
     double mean_fl = 200.0, sd_fl = 30.0;
     double min_count = 0.0;   // post-EM prune threshold (0 = disabled)
+    bool sam_raw = false;     // --sam-raw: emit full EC instead of EM-aware SAM
     std::string sam_path;
 
     for (int i = 4; i < argc; ++i) {
@@ -64,6 +131,8 @@ static void cmd_align(int argc, char* argv[])
             sam_path = argv[++i];
         } else if (flag == "--min-count" && i + 1 < argc) {
             min_count = std::stod(argv[++i]);
+        } else if (flag == "--sam-raw") {
+            sam_raw = true;
         }
     }
 
@@ -176,6 +245,19 @@ static void cmd_align(int argc, char* argv[])
             << std::setprecision(0) << em.tpm[t] << "\n";
     }
     std::cout << "TSV written to: " << tsv_path << "\n";
+
+    // EM-aware pseudobam: restrict each read's SAM alignments to expressed
+    // transcripts (estimated count >= active threshold), matching kallisto.
+    // --sam-raw disables this and keeps the full equivalence class.
+    if (!sam_path.empty() && !sam_raw) {
+        double active_min = (min_count > 0.0) ? min_count : 1.0;
+        std::unordered_set<std::string> active;
+        for (size_t t = 0; t < g.transcript_names.size(); ++t)
+            if (em.counts[t] >= active_min) active.insert(g.transcript_names[t]);
+        filter_sam_emaware(sam_path, active);
+        std::cout << "EM-aware pseudobam: kept " << active.size()
+                  << " expressed transcripts (count >= " << active_min << ")\n";
+    }
 
     auto t1 = std::chrono::steady_clock::now();
     double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
